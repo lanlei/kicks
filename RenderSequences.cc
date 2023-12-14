@@ -1,14 +1,10 @@
-#include <ai.h>
-#include <string>
+#include "RenderSequences.hpp"
+#include "ai.h"
 #include <vector>
 #include <iostream>
-#include <algorithm>
-#include <filesystem>
 #include <Eigen/Dense>
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
-
-namespace fs = std::filesystem;
 
 void LoadObj(const std::string& filepath, Eigen::MatrixX3f& vertices, Eigen::MatrixX3i& face_topo) {
 	tinyobj::ObjReader reader;
@@ -93,15 +89,7 @@ std::string ToStringZeroPad(int num, int length) {
 	return std::string(std::max(0, length - (int)old_string.length()), '0') + old_string;
 }
 
-int main() {
-	const fs::path ass_path = "/home/hansljy/maya/projects/textures/scenes/ass/cloth-teapot0060.ass";
-	const fs::path obj_dir = "/home/hansljy/Documents/Demo/Cloth-Teapot-Final/objs";
-	const fs::path output_dir = "/home/hansljy/Documents/Demo/Cloth-Teapot-Final/images";
-	const std::string demo_name = "cloth-teapot";
-
-	const int begin_itr = 60;
-	const int end_itr = 388;
-
+void RenderSequences(const fs::path& ass_path, const fs::path& obj_dir, const fs::path& output_dir, const std::string& demo_name, int begin_itr, int end_itr) {
 	AiBegin();
 	auto universe = AiUniverse();
 	auto session = AiRenderSession(universe, AI_SESSION_BATCH);
@@ -109,11 +97,14 @@ int main() {
 	auto load_ass_param = AiParamValueMap();
 	AiParamValueMapSetInt(load_ass_param, AtString("mask"), AI_NODE_ALL);
 
+	auto load_change_param = AiParamValueMap();
+	AiParamValueMapSetInt(load_change_param, AtString("mask"), AI_NODE_SHAPE);
+
 	AiSceneLoad (universe, ass_path.c_str(), load_ass_param);
 
-	/* preprocess */
+	std::vector<AtNode*> nodes_to_delete;
 
-	std::map<std::string, bool> is_obj_imported;
+	/* preprocess */
 	auto shape_itr = AiUniverseGetNodeIterator(universe, AI_NODE_SHAPE);
 	while (!AiNodeIteratorFinished(shape_itr)) {
 		auto node = AiNodeIteratorGetNext(shape_itr);
@@ -122,47 +113,24 @@ int main() {
 			// skipping arnold internal 'root' node
 			continue;
 		}
-		std::string obj_name = GetObjName(shape_name);
-		fs::path obj_path = obj_dir / (obj_name + ".obj");
-		if (!fs::is_regular_file(obj_path)) {
-			// Seriously? C-like format?
-			AiMsgWarning("%s not found, ignoring meshes for %s", obj_path.c_str(), obj_name.c_str());
-		}
-		is_obj_imported[obj_name] = fs::is_regular_file(obj_path);
-		Eigen::MatrixX3f vertices;
-		Eigen::MatrixX3i face_topo;
-		LoadObj(obj_path, vertices, face_topo);
-
-		const int num_vertices = vertices.rows();
-		const int num_faces = face_topo.rows();
-
-		auto nidxs = AiArrayAllocate(num_faces * 3, 1, AI_TYPE_INT);
-		for (int face_index = 0, point_index = 0; face_index < num_faces; face_index++, point_index += 3) {
-			AiArraySetInt(nidxs, point_index, face_topo(face_index, 0));
-			AiArraySetInt(nidxs, point_index + 1, face_topo(face_index, 1));
-			AiArraySetInt(nidxs, point_index + 2, face_topo(face_index, 2));
-		}
-		AiNodeSetArray(node, AtString("nidxs"), nidxs);
-
-		auto nlist = AiArrayAllocate(num_vertices * 3, 1, AI_TYPE_FLOAT);
-		Eigen::MatrixX3f normals;
-		CalculateSmoothedNormal(vertices, face_topo, normals);
-		for (int vertex_index = 0; vertex_index < num_vertices; vertex_index++) {
-			AiArraySetFlt(nlist, 3 * vertex_index, normals(vertex_index, 0));
-			AiArraySetFlt(nlist, 3 * vertex_index + 1, normals(vertex_index, 1));
-			AiArraySetFlt(nlist, 3 * vertex_index + 2, normals(vertex_index, 2));
-		}
-		AiNodeSetArray(node, AtString("nlist"), nlist);
+		nodes_to_delete.push_back(node);
 	}
 	AiNodeIteratorDestroy(shape_itr);
 
 	for (int itr = begin_itr; itr <= end_itr; itr++) {
-		AiMsgInfo("Loading iteration %d", itr);
+		for (auto node_to_delete : nodes_to_delete) {
+			AiNodeDestroy(node_to_delete);
+		}
+		nodes_to_delete.clear();
 		
 		/* reload objects (assume only vertices change) */
+		AiMsgInfo("Loading iteration %d", itr);
+		AiSceneLoad (universe, ass_path.c_str(), load_change_param);
 		auto shape_itr = AiUniverseGetNodeIterator(universe, AI_NODE_SHAPE);
+
 		while (!AiNodeIteratorFinished(shape_itr)) {
 			auto node = AiNodeIteratorGetNext(shape_itr);
+			nodes_to_delete.push_back(node);
 			std::string shape_name = AiNodeGetName(node);
 			if (shape_name == "root") {
 				// skipping arnold internal 'root' node
@@ -170,31 +138,36 @@ int main() {
 			}
 
 			std::string obj_name = GetObjName(shape_name);
-			if (!is_obj_imported[obj_name]) {
+			fs::path obj_path = obj_dir / (obj_name + "_itr" + ToStringZeroPad(itr, 4) + ".obj");
+			if (!fs::is_regular_file(obj_path)) {
+				AiMsgWarning("Iteration file for %s not found, use default instead", obj_name.c_str());
 				continue;
 			}
 
-			fs::path obj_path = obj_dir / (obj_name + "_itr" + ToStringZeroPad(itr, 4) + ".obj");
-			if (!fs::is_regular_file(obj_path)) {
-				AiMsgWarning("Iteration file for %s not found, do not update its movement", obj_name.c_str());
-				continue;
-			}
 			Eigen::MatrixX3f vertices;
 			Eigen::MatrixX3i face_topo;
 			LoadObj(obj_path, vertices, face_topo);
 
 			const int num_vertices = vertices.rows();
+			const int num_faces = face_topo.rows();
 
+			auto nidxs = AiArrayAllocate(num_faces * 3, 1, AI_TYPE_INT);
+			for (int face_index = 0, point_index = 0; face_index < num_faces; face_index++, point_index += 3) {
+				AiArraySetInt(nidxs, point_index, face_topo(face_index, 0));
+				AiArraySetInt(nidxs, point_index + 1, face_topo(face_index, 1));
+				AiArraySetInt(nidxs, point_index + 2, face_topo(face_index, 2));
+			}
+			AiNodeSetArray(node, AtString("nidxs"), nidxs);
 
-			// auto nlist = AiArrayAllocate(num_vertices * 3, 1, AI_TYPE_FLOAT);
-			// Eigen::MatrixX3f normals;
-			// CalculateSmoothedNormal(vertices, face_topo, normals);
-			// for (int vertex_index = 0; vertex_index < num_vertices; vertex_index++) {
-			// 	AiArraySetFlt(nlist, 3 * vertex_index, normals(vertex_index, 0));
-			// 	AiArraySetFlt(nlist, 3 * vertex_index + 1, normals(vertex_index, 1));
-			// 	AiArraySetFlt(nlist, 3 * vertex_index + 2, normals(vertex_index, 2));
-			// }
-			// AiNodeSetArray(node, AtString("nlist"), nlist);
+			auto nlist = AiArrayAllocate(num_vertices * 3, 1, AI_TYPE_FLOAT);
+			Eigen::MatrixX3f normals;
+			CalculateSmoothedNormal(vertices, face_topo, normals);
+			for (int vertex_index = 0; vertex_index < num_vertices; vertex_index++) {
+				AiArraySetFlt(nlist, 3 * vertex_index, normals(vertex_index, 0));
+				AiArraySetFlt(nlist, 3 * vertex_index + 1, normals(vertex_index, 1));
+				AiArraySetFlt(nlist, 3 * vertex_index + 2, normals(vertex_index, 2));
+			}
+			AiNodeSetArray(node, AtString("nlist"), nlist);
 
 			auto vlist = AiArrayAllocate(num_vertices * 3, 1, AI_TYPE_FLOAT);
 			for (int vertex_index = 0; vertex_index < num_vertices; vertex_index++) {
@@ -234,12 +207,10 @@ int main() {
 		AiNodeSetFlt(options, AtString("frame"), itr);
 
 		AiMsgInfo("Start rendering iteration %d", itr);
-		AiRender(session);
+		AiRender(session, AI_RENDER_MODE_CAMERA);
 	}
 
 	AiRenderSessionDestroy(session);
 	AiUniverseDestroy(universe);
 	AiEnd();
-
-	return 0;
-} 
+}
